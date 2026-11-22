@@ -8,7 +8,9 @@ The bot tracks opponents by the IDs, positions and velocities supplied by the se
 
 Movement uses a ground route through the map and the mech's current velocity to brake near a destination. The bot seeks a second weapon and cubes, faces pursuers while moving independently, and looks for cover when multiple opponents have a shot. Ground navigation is primary. Jump and jet recovery helps with obstructions, and the bot can skip loot it cannot reach.
 
-When a visible enemy is charging a laser along its line of sight to the bot, the bot moves toward nearby solid cover or crosses the beam's path. A low-health mech that breaks contact stays in cover for repairs while the zone permits. An uncontested supply drop close to completion can provide a faster full repair.
+House hunters fight from about 150 m with a hitscan laser, so the bot fights from cover. Whenever an opponent can see it, it scores nearby standing points by which opponents could hit any part of its body there. It shoots from points with a hidden spot a short dash away. While an enemy laser is ready, that spot must be within 5 m; for 1.65 s after a beam it may be farther. When a laser starts charging (visible for about 0.75 s), the bot runs to the hidden spot and stays there until the shot is released. A gun-only bot waits in cover for a distant laser carrier to come within 120 m, and closes on an unseen laser carrier through hidden points. Exploration runs along buildings, and the torso turns through a full look around every few seconds because house bots share vision.
+
+The second weapon slot prefers a laser, then lightning. A mortar is never taken, because lasers do +60% damage to a mech carrying one. A low-health mech that breaks contact stays in cover for repairs while the zone permits. An uncontested supply drop close to completion can provide a faster full repair.
 
 ## Test on your computer
 

@@ -252,6 +252,13 @@ class World:
         return (0 <= i < self.fw and 0 <= j < self.fh and
                 self.clearance[j * self.fw + i] >= self._minimum_clearance(radius))
 
+    def wall_distance(self, x, y):
+        """Metres from (x, y) to the nearest wall, steep slope or map edge (capped at 63 m)."""
+        i, j = math.floor((x - self.x0) / 2 + 0.5), math.floor((y - self.y0) / 2 + 0.5)
+        if not (0 <= i < self.fw and 0 <= j < self.fh):
+            return 0.0
+        return self.clearance[j * self.fw + i] / 4
+
     def walk_clear(self, a, b, radius=2.5):
         x, y = (a[0] - self.x0) / 2 + 0.5, (a[1] - self.y0) / 2 + 0.5
         dx, dy = (b[0] - a[0]) / 2, (b[1] - a[1]) / 2
