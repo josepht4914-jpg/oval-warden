@@ -30,6 +30,9 @@ class FlatArena:
     def walk_clear(self, a, b, radius=2.5):
         return True
 
+    def wall_distance(self, x, y):
+        return 63.0
+
     def move_toward(self, pos, goal, radius):
         dx, dy = goal[0] - pos[0], goal[1] - pos[1]
         d = math.hypot(dx, dy)
@@ -52,6 +55,41 @@ class Decisions(unittest.TestCase):
         self.obs["zone"].update(center=[0, 0], next_center=[0, 0], radius=250, next_radius=180)
         self.rival = dict(id=1, kind="mech", pos=[60, 0, 0], vel=[0, 11.7, 0], aim=[0, 0],
                           hp=1400, cubes=0, weapons=["gun"], charging=False)
+
+    def test_weapon_choices_skip_mortar_and_prefer_laser(self):
+        # House lasers do +60% to a mech carrying a mortar, so a mortar is never taken.
+        rules = self.hello["config"]["weapons"]
+        gun = dict(kind="gun", cooldown=0, ammo=12, reload=0, stats=rules["gun"])
+
+        def held(kind, charge=0):
+            return dict(kind=kind, cooldown=0, charge=charge, stats=rules[kind])
+
+        self.obs.update(mechs=[], crates=[], cubes=[])
+        # The gun stays; the other slot prefers a laser, then lightning.
+        cases = ((None, "mortar", None), (None, "laser", (8001, None)), (held("mortar"), "lightning", (8001, 1)),
+                 (held("lightning"), "laser", (8001, 1)), (held("laser"), "lightning", None),
+                 (held("laser", charge=.3), "laser", None), (held("laser"), "mortar", None))
+        for second, pickup, expected in cases:
+            self.me["weapons"] = [gun, second]
+            self.obs["pickups"] = [dict(id=8001, kind=pickup, pos=[1, 0, 0])]
+            action = self.pilot.act(self.obs)
+            got = (action["take"], action.get("drop")) if "take" in action else None
+            self.assertEqual(got, expected, f"holding {second and second['kind']}, {pickup} at our feet")
+
+    def test_stays_out_of_sight_while_a_laser_is_held_charged(self):
+        # A wall at x=35..36 hides us at x>36 from a sniper at x=-100. While it holds a charge,
+        # the bot must not step back out to peek, even though it could shoot from there.
+        with patch.object(bot, "World", FlatArena):
+            pilot = bot.Bot(self.hello)
+        pilot.world.wall = True
+        self.me["pos"] = [38, 0, 0]
+        self.rival.update(pos=[-100, 0, 0], vel=[0, 0, 0], aim=[0, 0], weapons=["gun", "laser"], charging=True)
+        self.obs["mechs"] = [self.rival]
+        for step in range(8):
+            self.obs.update(t=step / 10, tick=2 * step)
+            action = pilot.act(self.obs)
+            self.assertNotEqual(pilot.mode, "duel")
+            self.assertLessEqual(action["move"][0], 0.05 if self.me["pos"][0] > 36.5 else 1)
 
     def test_turn_and_lead_a_crossing_mech(self):
         self.me["aim"] = [-math.pi/2, 0]
