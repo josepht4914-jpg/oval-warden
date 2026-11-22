@@ -1,5 +1,6 @@
 """Oval Warden, a placement-focused mechfight/1 bot."""
 import math
+import random
 import time
 
 import mechfight
@@ -41,8 +42,17 @@ ESC_READY = float(os.environ.get("OW_ESC_READY", "5"))          # max dash to co
 ESC_COOL = float(os.environ.get("OW_ESC_COOL", "8.5"))          # ... while every enemy laser is recharging
 EXTRA_EXPOSE = float(os.environ.get("OW_EXTRA_EXPOSE", "10"))   # peek penalty per extra enemy with a shot
 LOS_THREATS = int(os.environ.get("OW_LOS_THREATS", "3"))        # enemies checked in the cover search
-GRAB_LASER = float(os.environ.get("OW_GRAB", "70"))   # run for a laser this close even mid-fight
+GRAB_LASER = float(os.environ.get("OW_GRAB", "100"))  # run for a laser this close even mid-fight
 GRAB_OTHER = 30.0
+# Weapon rush: while the second slot is empty, a remembered weapon this close outranks duel and retreat
+# (two-weapon mechs beat gun-only mechs 44:1 in recorded duels), unless a mech is close with a shot.
+RUSH_REACH = float(os.environ.get("OW_RUSH", "170"))
+RUSH_LASER_EXTRA = 40.0   # walk this much farther for a laser than for the nearest other weapon
+RUSH_CLOSE = 60.0         # a mech this close with line of sight puts the rush back to the mid-fight limits
+SWEEP = math.tau - math.radians(110)   # torso rotation that shows every direction once through a 120 degree wedge
+FORGET_RANGE = 40.0       # inside the 45 m proximity sensors: an item not reported here with a clear line is gone
+DROP_REACH = 250.0
+DASH = os.environ.get("OW_DASH", "1") == "1"   # strafe on the boost in duels
 BRAWL_REACH = 14.0     # start a lightning fight when a visible hunter is this far beyond arc range
 BRAWL_ENERGY = 30.0    # energy needed to start one
 AMBUSH = os.environ.get("OW_AMBUSH", "0") == "1"   # wait in cover for hunters (lost to peeking in simulation)
@@ -52,7 +62,49 @@ AMBUSH_WAIT = 6.0      # seconds to keep waiting in cover after losing track of 
 CUBE_GOAL = 10         # cubes stop adding HP and damage here and only make the mech bigger
 USE_GHOSTS = os.environ.get("OW_GHOSTS", "0") == "1"            # treat unexplained sounds as unseen threats
 PRECHARGE = os.environ.get("OW_PRECHARGE", "0") == "1"
+# Duel shape. Measured on recorded matches: one house expert deals ~150 HP/s under 50 m, ~75 at 75 m
+# and ~43 at 105-140 m; half of that is its laser, which cannot hit what it cannot see.
+DUEL_NEAR = float(os.environ.get("OW_DUEL_NEAR", "85"))    # preferred duel band against gun / laser / mortar
+DUEL_FAR = float(os.environ.get("OW_DUEL_FAR", "115"))
+DUEL_MIN = float(os.environ.get("OW_DUEL_MIN", "55"))      # never fight a gun / laser / lightning holder closer
+# Hiding from enemy laser charges. A charge from farther than HIDE_RANGE is "distant": it is dodged only
+# when cover is within DODGE_REACH, unless we are below HIDE_HP or HIDE_COUNT mechs charge at once.
+# 1e9 = hide from every charge as the 4.2 bot did. In the campaign simulator hiding less (60) lost
+# about 0.9 kills on schedule B, so it stays off until someone shows otherwise.
+HIDE_RANGE = float(os.environ.get("OW_HIDE_RANGE", "1e9"))
+HIDE_HP = float(os.environ.get("OW_HIDE_HP", ".35"))
+HIDE_COUNT = int(os.environ.get("OW_HIDE_COUNT", "3"))
+DODGE_REACH = float(os.environ.get("OW_DODGE_REACH", "7.5"))
+ZAP_RUSH = os.environ.get("OW_ZAP_RUSH", "1") == "1"       # holding lightning: close on a mech that has none
+PEEK = os.environ.get("OW_PEEK", "1") == "1"               # duel from beside cover when there is some in the band
+WEAVE = os.environ.get("OW_WEAVE", "1") == "1"             # swing either side of the firing position
+# 1 = when farther than DUEL_FAR + 25 m or closer than DUEL_MIN, leave cover and fix the range in the open
+# first. Campaign simulator, schedule B, 48 trials: 2.44 kills with 1, 3.21 with 0 (the 4.2 bot: 3.23).
+GATE = os.environ.get("OW_GATE", "0") == "1"
+# No firing position beside cover: 1 = strafe in the open, 0 = get behind something first (the 4.2 bot).
+OPEN_DUEL = os.environ.get("OW_OPEN", "0") == "1"
+# Starting a laser charge on the way to cover (half speed): 0 = allowed, 1 = not below HIDE_HP, 2 = never.
+NOCHARGE = int(os.environ.get("OW_NOCHARGE", "1"))
 STALK = os.environ.get("OW_STALK", "0") == "1"                  # close on unseen laser carriers through cover          # charge our laser while hiding from a held charge
+# Awareness (rear armour takes x1.5; our view is a 120 degree wedge plus 45 m all round).
+FACE = os.environ.get("OW_FACE", "1") == "1"             # turn the torso to attackers behind us
+FACE_S = 0.8            # one look at an attacker we cannot see: long enough to swing it into the view wedge
+FACE_WINDOW = 2.5       # seconds of damage reports that decide who is hurting us
+FACE_AGAIN = 5.0        # while shooting a mech, look away from it at most once per this many seconds
+FACE_REAL = float(os.environ.get("OW_FACE_REAL", "90"))   # damage in the window that is worth a look (two gun hits)
+FACE_BISECT = os.environ.get("OW_FACE_BISECT", "1") == "1"   # running for cover: face between attackers, not the target
+FACE_SWITCH = os.environ.get("OW_FACE_SWITCH", "1") == "1"   # fighting: turn to a tracked mech that hurts more
+FRONT_ARC = math.radians(80)   # attackers within this of our aim hit front armour (the arc is 90 a side)
+FINISH_HP = 0.25        # a visible target below this HP share is finished before we turn to anyone else
+FALL_BACK = os.environ.get("OW_FALL_BACK", "0") == "1"   # keep backing away through cover while hidden
+CHASE_S = 8.0           # a hunter seen this recently is assumed to be walking in on us
+CHASE_RANGE = 130.0     # ... if it was last seen within this distance
+RESET_HP = float(os.environ.get("OW_RESET_HP", "0"))   # after a kill below this HP share, heal before the next duel
+# Hard reset: also run from a hunter that has found us until HP is back. Off: the campaign simulator
+# showed no difference in kills either way (B 3.96 hard, 4.00 soft, se 0.65), and running from a
+# hunter that sees us did not raise HP at the next contact.
+RESET_HARD = os.environ.get("OW_RESET_HARD", "0") == "1"
+HEAD = os.environ.get("OW_HEAD", "1") == "1"             # the cover test also samples the top of our body
 
 
 class Bot:
@@ -78,6 +130,7 @@ class Bot:
         self.next_jump = 0
         self.last_explore = None
         self.unreachable_loot = {}
+        self.chase_key, self.chase_until = None, 0.0
         self.dodge_until = -1
         self.dodge_vector = None
         self.zone_phase = {}
@@ -92,9 +145,55 @@ class Bot:
         self.ambush_since, self.ambush_seen, self.no_ambush_until = None, -99.0, -99.0
         self.last_pos = {}        # mech id -> (position, had a laser) when last reported
         self.kill_sites = []      # [position, expiry, laser dropped]: where our kills left cubes and weapons
+        self.memory = {}          # loot id -> dict(id, what="pickups"|"crates"|"cubes", kind, pos): everything seen
+        self.forget_turn = 0
+        self.sweep_left, self.sweep_yaw = SWEEP, None   # opening look-around still to turn (radians)
+        self.hurt_at = -99.0
+        self.cruise = False       # boosting between loot (hysteresis on energy)
+        self.hop_origin = None    # where the last explore hop was chosen
+        self.rng = random.Random(hello["seed"])
+        self.strafe = self.side   # which way we cross the enemy's line of fire in a duel
+        self.strafe_until = -1.0  # next random reversal
+        self.dash = False         # strafing on the boost right now (hysteresis on energy)
+        self.duel_close = False   # inside the minimum duel range: boost back out
+        self.release_hold = 0     # decisions spent lining up a laser shot that must be let go early
+        self.soft_ids = frozenset()   # distant charging mechs: dodged only when cover is a step away
+        self.soft_dodge = False       # the current evade / cover is such a dodge (keep our own charge)
+        self.rear_mult = self.config["mech"].get("rear_mult", 1.5)
+        self.hurts = []           # (time, attacker id, bearing, damage before the rear multiplier, rear)
+        self.hurt_at = -99.0      # last time a mech damaged us
+        self.sighted = {}         # mech id -> (time, position, cubes) when last reported
+        self.glances = {}         # attacker id -> when we last started turning to it
+        self.fall_spot, self.fall_at = None, -99.0
+        self.dead_ends = []       # (cover spot we got stuck running to, expiry)
+        self.stuck_first = None   # when the current run of stuck periods began
+        self.resetting = False    # healing out of sight after a kill
+        self.facing = None        # attacker id(s) the torso is turned to guard against (diagnostics)
 
     def listen(self, obs):
-        now = obs["t"]
+        now, me = obs["t"], obs["self"]
+        for m in obs["mechs"]:
+            if m.get("kind") == "mech":
+                self.sighted[m["id"]] = (now, tuple(m["pos"]), m.get("cubes", 0))
+        for e in obs["events"]:
+            if e["type"] == "kill":
+                self.sighted.pop(e.get("target"), None)
+                self.hurts = [h for h in self.hurts if h[1] != e.get("target")]
+                if me["hp"] < RESET_HP * me["max_hp"]:
+                    # A duel started with more HP is won 91:30: heal out of sight before the next hunter.
+                    self.resetting = True
+                    self.repairing = self.repairing or RESET_HARD
+            elif (e["type"] == "damaged" and e.get("bearing") is not None and e.get("by") is not None
+                  and e.get("weapon") in ("gun", "laser", "lightning")):
+                # A mortar's bearing points at the blast, not the mech; drones and the zone are not faced.
+                rear = bool(e.get("rear"))
+                self.hurts.append((now, e["by"], e["bearing"],
+                                   e.get("amount", 0) / (self.rear_mult if rear else 1), rear))
+                self.hurt_at = now
+        if me["hp"] >= RESET_HP * me["max_hp"]:
+            self.resetting = False
+        self.hurts = [h for h in self.hurts if now - h[0] < FACE_WINDOW]
+        self.dead_ends = [d for d in self.dead_ends if d[1] > now]
         reports = [e for e in obs["events"] if e["type"] == "damaged" and e.get("bearing") is not None]
         if reports:
             self.last_bearing = reports[-1]["bearing"]
@@ -107,6 +206,156 @@ class Bot:
             if self.listen_until <= now or sound["dist"] == "near":
                 self.last_bearing = sound["bearing"]
                 self.listen_until = now + 0.9
+
+    def guard_aim(self, obs, aim, shooting, fighting):
+        """Yaw to face instead of `aim` so that the mechs hurting us stop hitting rear armour, or None.
+
+        aim is where the torso would point otherwise. shooting: combat is aiming along it at a mech.
+        fighting: and we mean to win that exchange (not running for cover), so turning away costs
+        our own damage and is done briefly and only for cause."""
+        me, now = obs["self"], obs["t"]
+        pos = me["pos"]
+        self.facing = None
+        if not FACE or not self.hurts:
+            return None
+        focus = self.combat.focus
+        target = focus if focus and focus.get("kind") == "mech" else None
+        if shooting and target and target.get("hp", math.inf) < FINISH_HP * target.get("max_hp", 1400):
+            return None  # nearly dead and in our sights: its death removes an attacker for good
+        tracked = {m["id"]: m for m in obs["mechs"] if m.get("kind") == "mech"}
+        weight, bearing, last = {}, {}, {}
+        for t, by, heard, amount, _ in self.hurts:
+            weight[by] = weight.get(by, 0) + amount
+            bearing[by], last[by] = heard, t
+        for i in bearing:
+            if i in tracked:
+                bearing[i] = angle_to(pos, tracked[i]["pos"])
+        behind = [i for i in weight if abs(math.remainder(bearing[i] - aim[0], math.tau)) > FRONT_ARC]
+        if not behind:
+            return None
+        ours = weight.get(target["id"], 0) if shooting and target else 0
+        culprit = max(behind, key=lambda i: (i not in tracked, weight[i]))
+        if culprit not in tracked:
+            # Not in view: look along the reported bearing. Once seen it is tracked for 5 s, so the
+            # cover search and the target choice know about it even after we turn back.
+            if now - last[culprit] >= FACE_S:
+                return None
+            if shooting:
+                # Looking away stops our own fire for about a second and shows our back to the
+                # target: only for real damage, and no less than the target itself is doing.
+                if weight[culprit] < max(FACE_REAL, ours):
+                    return None
+                if now - self.glances.get(culprit, -99) > FACE_AGAIN:
+                    self.glances[culprit] = now
+                if now - self.glances[culprit] >= FACE_S and weight[culprit] < 2 * ours + FACE_REAL:
+                    return None  # looked once and did not find it
+            self.facing = culprit
+            return bearing[culprit]
+        if not fighting and (FACE_BISECT or not shooting):
+            # Running or hiding: one facing that puts every attacker in front, if there is one.
+            yaws = sorted(bearing.values())
+            gap, k = max(((yaws[(j + 1) % len(yaws)] - yaws[j]) % math.tau if len(yaws) > 1 else math.tau, j)
+                         for j in range(len(yaws)))
+            spread = math.tau - gap
+            if spread < 2 * FRONT_ARC:
+                self.facing = tuple(sorted(weight))
+                return math.remainder(yaws[(k + 1) % len(yaws)] + spread / 2, math.tau)
+            self.facing = max(weight, key=weight.get)
+            return bearing[self.facing]
+        # Shooting at a mech while a tracked one hits our back: turn only if it clearly hurts more,
+        # and hand it to combat as the target (its stickiness then keeps the torso there).
+        if not fighting or not FACE_SWITCH or weight[culprit] <= 1.3 * ours + 40:
+            return None
+        if now - self.glances.get(culprit, -99) > FACE_AGAIN:
+            self.glances[culprit] = now
+        if now - self.glances[culprit] >= FACE_S:
+            return None
+        self.combat.focus = tracked[culprit]
+        self.facing = culprit
+        return bearing[culprit]
+
+    def hunters(self, obs, threats):
+        """Mechs to stay away from: tracked ones, plus those seen in the last CHASE_S seconds at
+        their last known position (a hunter that loses sight of us walks in), nearest first."""
+        now, pos = obs["t"], obs["self"]["pos"]
+        known = {m["id"] for m in threats}
+        out = list(threats)
+        for i, (t, where, cubes) in self.sighted.items():
+            if i not in known and now - t < CHASE_S:
+                out.append(dict(id=i, kind="mech", pos=list(where), cubes=cubes, weapons=()))
+        out = [m for m in out if distance(pos, m["pos"]) < CHASE_RANGE]
+        out.sort(key=lambda m: distance(pos, m["pos"]))
+        return out[:LOS_THREATS]
+
+    FALL_RINGS = ((23, 12, math.pi / 12), (41, 16, 0), (11, 12, 0), (68, 16, math.pi / 16))
+
+    def fall_back(self, obs, chasers):
+        """While out of sight: a hidden point farther from the hunters, or None to stay put.
+
+        75% of lethal damage is dealt inside 75 m and regeneration does not need us to stand
+        still, so waiting where the hunter last saw us only lets it choose the range."""
+        if not FALL_BACK or not chasers:
+            return None
+        pos, now = obs["self"]["pos"], obs["t"]
+        if (self.fall_spot is not None and now - self.fall_at < 2.0 and distance(pos, self.fall_spot) > 3
+                and not self.dead_end(self.fall_spot) and self.still_hidden(obs, chasers, self.fall_spot)):
+            return self.fall_spot
+        here = min(distance(pos, m["pos"]) for m in chasers)
+        next_center, next_radius = obs["zone"]["next_center"], obs["zone"]["next_radius"]
+        # The full search costs 7 ms (median, three hunters) to 40 ms: give it half the usual budget,
+        # most useful rings first, because the walk to a far point can still need a route search.
+        budget = self.deadline, self.hard_deadline
+        self.deadline, self.hard_deadline = budget[0] - .004, budget[1] - .005
+        try:
+            points = self.cover_points(obs, chasers, self.FALL_RINGS)
+        finally:
+            self.deadline, self.hard_deadline = budget
+        ranked = []
+        for p, _, any_part, ring in points:
+            if any_part or self.dead_end(p):
+                continue
+            gain = min(distance(p, m["pos"]) for m in chasers) - here
+            score = gain - .12 * ring - .6 * max(0, distance(p, next_center) - next_radius + 8)
+            if score > 3:
+                ranked.append((score, p))
+        ranked.sort(reverse=True)
+        for _, p in ranked[:4]:
+            # The way there should not cross a line of fire either (checked at the middle).
+            middle = ((pos[0] + p[0]) / 2, (pos[1] + p[1]) / 2)
+            if time.perf_counter() > self.hard_deadline or self.still_hidden(obs, chasers, middle):
+                self.fall_spot, self.fall_at = tuple(p), now
+                return self.fall_spot
+        self.fall_spot = None
+        return None
+
+    def dead_end(self, spot):
+        return any(distance(spot, p) < 5 for p, _ in self.dead_ends)
+
+    def rest(self, obs, threats):
+        """Out of every tracked mech's sight and regenerating: set mode and goal.
+
+        Returns False when nobody is near and we are only topping up after a kill: then healing
+        happens on the move (loot, explore), since regeneration does not need us to stand still."""
+        me = obs["self"]
+        pos = me["pos"]
+        hurt = me["hp"] < REPAIR_LOW * me["max_hp"]
+        held = {w["kind"] for w in me["weapons"] if w}
+        zone_center, zone_radius = self.live_zone(obs)
+        for site, _, has_laser in self.kill_sites:
+            # What our kill dropped comes first: each cube is +4% HP on the spot.
+            d = distance(pos, site)
+            if (5 < d <= (45 if hurt else 90) and abs(site[2] - pos[2]) <= 4
+                    and (me["cubes"] < CUBE_GOAL or (has_laser and "laser" not in held))
+                    and tuple(site[:2]) not in self.unreachable_loot
+                    and distance(site, zone_center) <= zone_radius - 2):
+                self.mode, self.goal = "loot", tuple(site[:2])
+                return True
+        chasers = self.hunters(obs, threats)
+        away = self.fall_back(obs, chasers)
+        if away is None and not (hurt or threats or chasers):
+            return False
+        self.mode, self.goal = "repair", away if away is not None else tuple(pos[:2])
+        return True
 
     def live_zone(self, obs):
         """The circle that hurts right now: (center, radius).
@@ -149,9 +398,72 @@ class Bot:
         # Enter well inside the safe boundary. Large circles leave room to use perimeter cover.
         return point_at(center, angle_to(center, pos), min(distance(pos, center), 0.67 * radius))
 
+    def remember(self, obs):
+        """Keep every pickup, crate and cube ever seen (only what is in view is reported).
+
+        An entry is dropped when we took it, when a take says it is gone, or when its spot is inside
+        the proximity sensors with a clear line and the server no longer lists it."""
+        me, now = obs["self"], obs["t"]
+        pos = me["pos"]
+        listed = set()
+        for what in ("pickups", "crates", "cubes"):
+            for obj in obs.get(what) or ():
+                listed.add(obj["id"])
+                entry = self.memory.get(obj["id"])
+                if entry is None:
+                    self.memory[obj["id"]] = dict(id=obj["id"], what=what, kind=obj.get("kind"), pos=obj["pos"])
+                    if what == "pickups":
+                        self.plan_at = now   # a weapon came into view: decide again at once
+                else:
+                    entry["pos"], entry["kind"] = obj["pos"], obj.get("kind")
+        for event in obs["events"]:
+            if event["type"] == "took" or (event["type"] == "take_failed" and event.get("reason") == "gone"):
+                self.memory.pop(event.get("id"), None)
+            elif event["type"] == "damaged":
+                self.hurt_at = now
+        eye = with_height(pos, me["stats"]["eye_height"])
+        nearby = [e for e in self.memory.values() if e["id"] not in listed
+                  and abs(e["pos"][0] - pos[0]) <= FORGET_RANGE and abs(e["pos"][1] - pos[1]) <= FORGET_RANGE
+                  and distance(pos, e["pos"]) <= FORGET_RANGE]
+        # A handful of sight lines per decision; the rest wait for the next one.
+        self.forget_turn += 1
+        for k in range(min(8, len(nearby))):
+            entry = nearby[(self.forget_turn + k) % len(nearby)]
+            p = entry["pos"]
+            if ((distance(pos, p) < 3 and abs(p[2] - pos[2]) < 4)
+                    or self.world.clear(eye, (p[0], p[1], p[2] + 1.0))):
+                self.memory.pop(entry["id"], None)
+
+    def wanted_weapon(self, me, kind):
+        _, held_value = self.weapon_slot(me)
+        return WEAPON_VALUE.get(kind, 0) > held_value and all(not w or w["kind"] != kind for w in me["weapons"])
+
+    def on_roof(self, p, pos):
+        """A spot more than 4 m above the ground that is not on our own level."""
+        return p[2] > self.world.ground(p[0], p[1]) + 4 and abs(p[2] - pos[2]) > 4
+
+    @staticmethod
+    def our_ring(obs):
+        """The landed supply drop whose ring we stand in with nobody else holding it, or None."""
+        me = obs["self"]
+        for drop in obs.get("drops") or ():
+            if (drop["lands_in"] <= 0 and drop.get("holder") in (None, me["id"])
+                    and distance(me["pos"], drop["pos"]) <= drop["radius"] - 1):
+                return drop
+        return None
+
+    def ring_point(self, pos, drop):
+        """Keep walking a small circle inside the ring: a standing mech is the easiest target there is."""
+        angle = angle_to(drop["pos"], pos) + self.side * .9
+        return point_at(drop["pos"], angle, min(4.0, .5 * drop["radius"]))
+
     def loot_options(self, obs):
         me, zone = obs["self"], obs["zone"]
         pos, radius = me["pos"], me["stats"]["radius"]
+        ring = self.our_ring(obs)
+        if ring is not None:
+            # A capture that is running (full repair, full energy, 3 cubes) comes before any other loot.
+            return self.ring_point(pos, ring)
         options = []
         zone_center, zone_radius = self.live_zone(obs)
         self.unreachable_loot = {p: expiry for p, expiry in self.unreachable_loot.items() if expiry > obs["t"]}
@@ -169,28 +481,68 @@ class Bot:
                 return
             score = value - 0.34 * dist
             options.append((score, p))
-        for cube in obs["cubes"]:
-            if me["cubes"] < CUBE_GOAL:
-                consider(cube, 47, 90)
         _, held_value = self.weapon_slot(me)
         held = {w["kind"] for w in me["weapons"] if w}
-        for weapon in obs["pickups"]:
-            if WEAPON_VALUE.get(weapon["kind"], 0) > held_value and weapon["kind"] not in held:
-                best = weapon["kind"] == "laser"
-                consider(weapon, (110 if best else 50) + WEAPON_VALUE[weapon["kind"]], 190 if best else 105)
+        unarmed = len(held) < 2
+        for item in self.memory.values():
+            what = item["what"]
+            if what == "cubes":
+                if me["cubes"] < CUBE_GOAL:
+                    consider(item, 47, 90)
+            elif what == "pickups":
+                kind = item["kind"]
+                if WEAPON_VALUE.get(kind, 0) > held_value and kind not in held:
+                    best = kind == "laser"
+                    consider(item, (110 if best else 50) + WEAPON_VALUE[kind], 190 if best else 105)
+            elif unarmed:
+                # No second weapon known: a crate drops one half the time.
+                consider(item, 46, 150)
+            elif me["cubes"] < CUBE_GOAL:
+                consider(item, 24, 70)
         for site, _, has_laser in self.kill_sites:
             # A kill leaves its cubes plus two, and every weapon but the gun, often out of sight.
             wanted = (has_laser and "laser" not in held) or me["cubes"] < CUBE_GOAL
             if wanted and distance(pos, site) > 5:
                 consider(dict(pos=site), 95 if has_laser and "laser" not in held else 60, 260)
-        for crate in obs["crates"]:
-            if me["cubes"] < CUBE_GOAL or len(held) < 2:
-                consider(crate, 24, 70)
-        for drop in obs.get("drops", []):
-            contested = drop.get("holder") not in (None, me["id"])
-            if not contested and drop["lands_in"] < 4 and (me["cubes"] < 10 or me["hp"] < me["max_hp"] * .8):
-                consider(drop, 57 - 2 * drop["lands_in"], 90)
+        walk = max(1.0, me["stats"]["walk_speed"]) * .8
+        for drop in obs.get("drops") or ():
+            if drop.get("holder") not in (None, me["id"]):
+                continue
+            if not (me["cubes"] < 10 or me["hp"] < me["max_hp"] * .8):
+                continue
+            spot = drop["pos"]
+            if sum(1 for m in obs["mechs"] if m["kind"] == "mech" and distance(m["pos"], spot) < 80) >= 2:
+                continue
+            # Leave so as to arrive as it lands (at most ~3 s early); late is still worth it.
+            travel = max(0.0, distance(pos, spot) - drop["radius"]) / walk
+            if drop["lands_in"] <= travel + 3:
+                needed = me["hp"] < me["max_hp"] * .7 or me["cubes"] < 10
+                consider(drop, (250 if needed else 57) - 2 * drop["lands_in"], DROP_REACH)
         return max(options, key=lambda item: item[0])[1] if options else None
+
+    def far_loot(self, obs):
+        """Nearest remembered loot we still want inside the next circle, however far (explore heads there)."""
+        me, zone = obs["self"], obs["zone"]
+        pos = me["pos"]
+        unarmed = any(w is None for w in me["weapons"])
+        best, best_dist = None, math.inf
+        for item in self.memory.values():
+            what, p = item["what"], item["pos"]
+            if what == "pickups":
+                if not self.wanted_weapon(me, item["kind"]):
+                    continue
+            elif what == "crates":
+                if not unarmed and me["cubes"] >= CUBE_GOAL:
+                    continue
+            elif me["cubes"] >= CUBE_GOAL:
+                continue
+            dist = distance(pos, p) + (0 if what == "pickups" else 60)
+            if dist >= best_dist or tuple(p[:2]) in self.unreachable_loot or self.on_roof(p, pos):
+                continue
+            if distance(p, zone["next_center"]) > zone["next_radius"] * .9:
+                continue
+            best, best_dist = (p[0], p[1]), dist
+        return best
 
     @staticmethod
     def weapon_slot(me):
@@ -280,12 +632,8 @@ class Bot:
             elif retreat:
                 score += min(dist, 125) * .35 - 38 * exposed
             else:
-                if any(w and w["kind"] == "lightning" for w in me["weapons"]):
-                    ideal = 36
-                elif any(kind in ("laser", "mortar") for kind in threats[0].get("weapons", ())):
-                    ideal = min(145, max(66, distance(pos, foe)))
-                else:
-                    ideal = 66
+                near, far, _ = self.duel_band(obs, threats[0])
+                ideal = min(far, max(near, distance(pos, foe)))
                 score -= .48 * abs(dist - ideal)
                 score += 7 if exposed == 1 else -6 * exposed
                 score += 6 * math.cos(angle_to(pos, p) - heading) if i else 0
@@ -309,35 +657,72 @@ class Bot:
                 return self.last_explore
         if zone["next_radius"] < 12:
             return zone["next_center"]
-        self.heading += self.side * 1.31
         radius = obs["self"]["stats"]["radius"]
+        hop = min(52, zone["next_radius"] * .55)
+
+        def allowed(p):
+            return (distance(p, zone["next_center"]) < zone["next_radius"] * .9
+                    and self.world.is_walkable(p[0], p[1], radius))
+        # Hop toward loot remembered out of reach, else toward the middle of the next circle,
+        # along buildings: a sniper who finds us there leaves a wall within a short dash.
+        target = self.far_loot(obs)
+        loot = target is not None
+        if target is None and distance(pos, zone["next_center"]) > 70:
+            target = tuple(zone["next_center"])
+        # Asked for a new hop without having moved: the last one led nowhere. Try another way round.
+        failed = self.hop_origin is not None and distance(pos, self.hop_origin) < 6
+        self.hop_origin = (pos[0], pos[1])
+        if failed and loot:
+            self.unreachable_loot[target] = obs["t"] + 20
+        if target is not None and not failed:
+            if distance(pos, target) <= hop + 8 and allowed(target):
+                self.last_explore = tuple(target)
+                return self.last_explore
+            toward = angle_to(pos, target)
+            best, best_score = None, -math.inf
+            for turn in (0, .45, -.45, .9, -.9, 1.35, -1.35):
+                p = point_at(pos, toward + turn, hop)
+                if not allowed(p):
+                    continue
+                score = hop * math.cos(turn) + (9 if self.world.wall_distance(*p) <= radius + 6 else 0)
+                if score > best_score:
+                    best, best_score = p, score
+            if best is not None:
+                self.last_explore = best
+                return best
+        self.heading += self.side * 1.31
         options = []
         for step in range(8):
-            p = point_at(pos, self.heading + step * self.side * math.pi / 4, min(52, zone["next_radius"] * .55))
-            if (distance(p, zone["next_center"]) < zone["next_radius"] * .9
-                    and self.world.is_walkable(*p, radius)):
+            p = point_at(pos, self.heading + step * self.side * math.pi / 4, hop)
+            if allowed(p):
                 options.append(p)
         if not options:
             return zone["next_center"]
-        # Travel along buildings: a sniper who finds us there leaves a wall within a short dash.
         walled = [p for p in options if self.world.wall_distance(*p) <= radius + 6]
         self.last_explore = (walled or options)[0]
         return self.last_explore
 
     def finishing_drop(self, obs, threats):
-        """Stay in an uncontested ring through the last moments of a full repair."""
+        """Stay in an uncontested ring with hunters about when the repair will come before they can
+        stop it: always through the last moments, earlier while HP covers the wait."""
         me = obs["self"]
-        for drop in obs.get("drops", ()):
+        for drop in obs.get("drops") or ():
             if drop["lands_in"] > 0 or drop.get("holder") != me["id"]:
                 continue
             left = drop["capture_s"] - drop["progress"]
             ring = drop["radius"]
-            if not 0 < left <= .9 or distance(me["pos"], drop["pos"]) > ring:
+            if not 0 < left or distance(me["pos"], drop["pos"]) > ring:
                 continue
-            # A runner immediately outside can contest the clock before it completes.
-            reach = ring + left * me["stats"]["boost_speed"] * 1.2
+            if left <= .9:
+                # A runner immediately outside can contest the clock before it completes.
+                reach = ring + left * me["stats"]["boost_speed"] * 1.2
+            elif me["hp"] > 150 * left * max(1, len(threats)):
+                # About 150 HP/s is what one expert deals at its closest; the capture restores everything.
+                reach = ring + 6 + left * me["stats"]["walk_speed"] * 1.1
+            else:
+                continue
             if all(distance(m["pos"], drop["pos"]) > reach for m in threats):
-                return drop["pos"]
+                return self.ring_point(me["pos"], drop)
         return None
 
     def body_scale(self, mech):
@@ -379,10 +764,15 @@ class Bot:
                 else:
                     p, z = (pos[0], pos[1]), pos[2]
                 body = (p[0], p[1], z + 0.5 * stats["height"])
+                head = (p[0], p[1], z + 0.93 * stats["height"])
                 center, any_part = set(), set()
                 for i, gun in guns:
                     if self.world.clear(gun, body):
                         center.add(i)
+                        any_part.add(i)
+                        continue
+                    # Low cover hides the middle of the body and leaves the head in the beam.
+                    if HEAD and self.world.clear(gun, head):
                         any_part.add(i)
                         continue
                     # A center behind a corner can still leave a shoulder in the beam.
@@ -406,6 +796,8 @@ class Bot:
             for side in (0, -stats["radius"], stats["radius"]):
                 if self.world.clear(gun, (body[0] + side * math.cos(a), body[1] + side * math.sin(a), body[2])):
                     return False
+            if HEAD and self.world.clear(gun, (spot[0], spot[1], z + 0.93 * stats["height"])):
+                return False
         return True
 
     def hide_point(self, obs, threats, points=None):
@@ -415,7 +807,7 @@ class Bot:
         throws away the momentum the 0.75 s laser warning depends on."""
         pos, now = obs["self"]["pos"], obs["t"]
         if (self.hide_spot is not None and now - self.hide_at < 1.5 and distance(pos, self.hide_spot) < 40
-                and self.still_hidden(obs, threats, self.hide_spot)):
+                and not self.dead_end(self.hide_spot) and self.still_hidden(obs, threats, self.hide_spot)):
             self.hide_at = now
             return self.hide_spot
         if points is None:
@@ -426,14 +818,14 @@ class Bot:
                 if time.perf_counter() > self.deadline:
                     break
                 group = self.cover_points(obs, threats, self.FAR_RINGS)
-            hidden = [c for c in group if not c[2]]
+            hidden = [c for c in group if not c[2] and not (self.dead_ends and self.dead_end(c[0]))]
             if hidden:
                 self.hide_spot = tuple(min(hidden, key=lambda c: c[3] - 0.08 * distance(c[0], foe))[0][:2])
                 self.hide_at = now
                 return self.hide_spot
         return None
 
-    def peek_point(self, obs, threats, ideal, escape_limit=7):
+    def peek_point(self, obs, threats, band, escape_limit=7):
         """A firing position on the primary threat with cover a short dash away.
 
         A charging laser is visible for about 0.75 s before it fires; a walking mech covers
@@ -442,6 +834,7 @@ class Bot:
         hidden = [c[0] for c in points if not c[2]]
         primary = threats[0]
         radius = obs["self"]["stats"]["radius"]
+        near, far, floor = band
         best, best_score = None, -math.inf
         for p, seen, _, ring in points:
             if primary["id"] not in seen:
@@ -451,8 +844,10 @@ class Bot:
                          default=math.inf)
             if escape > escape_limit:
                 continue
-            score = (-0.5 * ring - 3.0 * escape - 0.06 * abs(distance(p, primary["pos"]) - ideal)
-                     - EXTRA_EXPOSE * (len(seen) - 1))
+            d = distance(p, primary["pos"])
+            # Outside the preferred band the range error outweighs the walk (0.5 per metre of ring).
+            score = (-0.5 * ring - 3.0 * escape - 0.8 * (max(0, near - d) + max(0, d - far))
+                     - 3.0 * max(0, floor - d) - EXTRA_EXPOSE * (len(seen) - 1))
             if score > best_score:
                 best, best_score = p, score
         return best, points
@@ -468,33 +863,56 @@ class Bot:
         return min(hidden, key=lambda c: distance(c[0], foe))[0] if hidden else None
 
     def grab_point(self, obs):
-        """A weapon worth interrupting a fight for: lightning nearby, or any second weapon at our feet."""
+        """A weapon worth leaving a fight for.
+
+        Second slot empty (the weapon rush): any remembered laser or lightning within RUSH_REACH, the
+        laser unless it is more than RUSH_LASER_EXTRA farther than the other. With a mech close and
+        looking at us, or with a second weapon already held, only the short mid-fight distances."""
         me = obs["self"]
         pos, radius = me["pos"], me["stats"]["radius"]
+        if self.our_ring(obs) is not None:
+            return None   # never walk out of a running capture for a weapon
         _, held_value = self.weapon_slot(me)
         held = {w["kind"] for w in me["weapons"] if w}
         zone_center, zone_radius = self.live_zone(obs)
-        best, best_dist = None, math.inf
-        for p in obs["pickups"]:
-            kind, at = p["kind"], p["pos"]
+        rush = any(w is None for w in me["weapons"])
+        if rush:
+            eyes = with_height(pos, me["stats"]["eye_height"])
+            for m in obs["mechs"]:
+                if (m["kind"] == "mech" and distance(pos, m["pos"]) <= RUSH_CLOSE
+                        and self.world.clear(eyes, with_height(m["pos"], 4.5 * self.body_scale(m)))):
+                    rush = False
+                    break
+        laser_reach = max(GRAB_LASER, RUSH_REACH) if rush else GRAB_LASER
+        other_reach = RUSH_REACH if rush else GRAB_OTHER
+        nearest = {}   # is it a laser -> (distance, point)
+        for item in self.memory.values():
+            if item["what"] != "pickups":
+                continue
+            kind, at = item["kind"], item["pos"]
             if kind in held or WEAPON_VALUE.get(kind, 0) <= held_value or tuple(at[:2]) in self.unreachable_loot:
                 continue
+            best = kind == "laser"
             dist = distance(pos, at)
-            if dist > (GRAB_LASER if kind == "laser" else GRAB_OTHER) or dist >= best_dist:
+            if dist > (laser_reach if best else other_reach) or dist >= nearest.get(best, (math.inf,))[0]:
                 continue
-            if distance(at, zone_center) > zone_radius - 2 or abs(at[2] - pos[2]) > 4:
+            if distance(at, zone_center) > zone_radius - 2 or self.on_roof(at, pos):
                 continue
             if dist > 4 and not self.world.is_walkable(at[0], at[1], radius):
                 continue
-            best, best_dist = tuple(at[:2]), dist
-        if best is None and "laser" not in held:
+            nearest[best] = (dist, tuple(at[:2]))
+        if "laser" not in held:
             for site, _, has_laser in self.kill_sites:
                 dist = distance(pos, site)
-                if (has_laser and 5 < dist <= GRAB_LASER and dist < best_dist and abs(site[2] - pos[2]) <= 4
+                if (has_laser and 5 < dist <= laser_reach and dist < nearest.get(True, (math.inf,))[0]
+                        and abs(site[2] - pos[2]) <= 4
                         and tuple(site[:2]) not in self.unreachable_loot
                         and distance(site, zone_center) <= zone_radius - 2):
-                    best, best_dist = tuple(site[:2]), dist
-        return best
+                    nearest[True] = (dist, tuple(site[:2]))
+        laser, other = nearest.get(True), nearest.get(False)
+        if laser and (other is None or laser[0] <= other[0] + RUSH_LASER_EXTRA):
+            return laser[1]
+        return other[1] if other else None
 
     def brawl_point(self, obs, threats, target):
         """Where to stand in a lightning fight: in arc range of the target, seen by as few others as possible."""
@@ -511,14 +929,132 @@ class Bot:
                 best, best_score = p, score
         return best if best is not None else tuple(target["pos"][:2])
 
+    def duel_band(self, obs, threat):
+        """(nearest, farthest, never-closer-than) distance to fight this mech at.
+
+        A house expert's damage on us falls from ~150 HP/s under 50 m to ~43 HP/s at 105-140 m, while
+        an accurate laser still hits at that range. A lightning holder only fires inside 42 m and walks
+        straight in: the same band keeps us out of its reach while we shoot it."""
+        theirs = threat.get("weapons", ())
+        if ZAP_RUSH and self.zap_range > 0 and "lightning" not in theirs:
+            return .5 * self.zap_range, .85 * self.zap_range, 0.0
+        return DUEL_NEAR, DUEL_FAR, DUEL_MIN
+
     def duel_range(self, obs, threat):
+        near, far, _ = self.duel_band(obs, threat)
+        return min(far, max(near, distance(obs["self"]["pos"], threat["pos"])))
+
+    def quick_cover(self, obs, foes):
+        """A point hidden from the listed mechs that we reach before a charge that just began is let go
+        (the house laser fires 0.8 s after it starts charging), or None."""
         me = obs["self"]
-        held = {w["kind"] for w in me["weapons"] if w}
-        if "lightning" in held:
-            return 36
-        if "laser" in held:
-            return min(150, max(60, distance(me["pos"], threat["pos"])))
-        return 80
+        charging = any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"])
+        reach = DODGE_REACH * (.55 if charging else 1)   # our own charge halves our speed
+        # Its own small time slice: the plan that follows still needs the rest of the budget.
+        deadline, hard = self.deadline, self.hard_deadline
+        self.deadline = self.hard_deadline = min(deadline, time.perf_counter() + .003)
+        try:
+            points = self.cover_points(obs, foes, self.NEAR_RINGS[:3])
+        finally:
+            self.deadline, self.hard_deadline = deadline, hard
+        hidden = [c for c in points if not c[2] and c[3] <= reach]
+        return tuple(min(hidden, key=lambda c: c[3])[0][:2]) if hidden else None
+
+    def weave(self, obs, targets, threats, anchor):
+        """Never stand at a firing position: swing a few metres either side of it, across the primary
+        threat's line of fire, reversing at random, without stepping into another threat's view."""
+        me, now = obs["self"], obs["t"]
+        pos, stats = me["pos"], me["stats"]
+        swing = 6.5 if self.dash else 4
+        if distance(pos, anchor) > swing + 2:
+            return anchor
+        if now >= self.strafe_until:
+            if self.rng.random() < .85:
+                self.strafe = -self.strafe
+            self.strafe_until = now + self.rng.uniform(.5, 1.1)
+        primary = targets[0]
+        chest = with_height(primary["pos"], 4.5 * self.body_scale(primary))
+        others = [with_height(m["pos"], self.config["mech"]["muzzle_height"] * self.body_scale(m))
+                  for m in threats if m["id"] != primary["id"]][:2]
+        tangent = angle_to(primary["pos"], anchor) + math.pi / 2
+        for side in (self.strafe, -self.strafe):
+            p = point_at(anchor, tangent, swing * side)
+            if (not self.world.is_walkable(p[0], p[1], stats["radius"])
+                    or not self.world.walk_clear(pos, p, stats["radius"])):
+                continue
+            if time.perf_counter() <= self.hard_deadline:
+                z = self.world.ground(*p)
+                if not self.world.clear((p[0], p[1], z + stats["muzzle_height"]), chest):
+                    continue
+                body = (p[0], p[1], z + .5 * stats["height"])
+                if any(self.world.clear(gun, body) for gun in others):
+                    continue
+            self.strafe = side
+            return p
+        return anchor
+
+    def duel_point(self, obs, targets, threats):
+        """Where to walk in a duel: across the primary threat's line of fire, reversing at random
+        (a linear-lead gun misses a target that reverses), steering into the preferred range band and
+        keeping the target in our sights. Never a place to stand: the goal is always a stride away."""
+        me, now = obs["self"], obs["t"]
+        pos, stats = me["pos"], me["stats"]
+        radius = stats["radius"]
+        primary = targets[0]
+        foe = primary["pos"]
+        dist = distance(pos, foe)
+        near, far, floor = self.duel_band(obs, primary)
+        if now >= self.strafe_until:
+            if self.rng.random() < .85:
+                self.strafe = -self.strafe
+            self.strafe_until = now + self.rng.uniform(.5, 1.1)
+        self.duel_close = dist < floor
+        # Radial wish: negative backs away, positive closes in, zero inside the band.
+        if dist < floor:
+            radial = -2.2
+        elif dist < near:
+            radial = -.35 - .9 * (near - dist) / max(1.0, near - floor)
+        elif dist > far:
+            radial = .35 + min(1.0, (dist - far) / 30)
+        else:
+            radial = 0.0
+        toward = angle_to(pos, foe)
+        cos_t, sin_t = math.cos(toward), math.sin(toward)
+        zone_center, zone_radius = self.live_zone(obs)
+        chest = with_height(foe, 4.5 * self.body_scale(primary))
+        others = [(m, with_height(m["pos"], self.config["mech"]["muzzle_height"] * self.body_scale(m)))
+                  for m in threats if m["id"] != primary["id"]][:2]
+        best, best_score, best_side = None, -math.inf, self.strafe
+        for side in (self.strafe, -self.strafe):
+            heading = math.atan2(side * cos_t + radial * sin_t, -side * sin_t + radial * cos_t)
+            for turn in (0, .5, -.5, 1.0, -1.0, 1.5, -1.5):
+                p = point_at(pos, heading + turn, 10)
+                if not self.world.is_walkable(p[0], p[1], radius) or not self.world.walk_clear(pos, p, radius):
+                    continue
+                d = distance(p, foe)
+                score = 10 * math.cos(turn) - (5 if side != self.strafe else 0)
+                score -= 5 * max(0, distance(p, zone_center) - (zone_radius - 8))
+                if d < floor:
+                    score -= 12 + 2.5 * (floor - d)
+                elif d < near:
+                    score -= .6 * (near - d)
+                elif d > far:
+                    score -= .4 * (d - far)
+                if time.perf_counter() <= self.hard_deadline:
+                    z = self.world.ground(*p)
+                    if not self.world.clear((p[0], p[1], z + stats["muzzle_height"]), chest):
+                        score -= 9   # a place we cannot shoot it from
+                    body = (p[0], p[1], z + .5 * stats["height"])
+                    for m, gun in others:
+                        if self.world.clear(gun, body):
+                            score -= EXTRA_EXPOSE
+                        score -= 1.5 * max(0, DUEL_MIN - distance(p, m["pos"]))
+                if score > best_score:
+                    best, best_score, best_side = p, score, side
+        if best is None:
+            return self.maneuver(obs, targets, False, False)
+        self.strafe = best_side
+        return best
 
     def plan(self, obs, threats, urgent, emergency, laser, shelter):
         me = obs["self"]
@@ -534,10 +1070,23 @@ class Bot:
             self.repairing = False
         retreat = self.repairing or now < self.hide_until
         capture = self.finishing_drop(obs, threats)
+        # Distant charges only (HIDE_RANGE): not worth breaking off a fight for, but stepping behind a
+        # wall that is right here costs nothing and the beam cannot hit what it cannot see.
+        quick = None
+        self.soft_dodge = False
+        if not urgent and (laser or shelter) and (laser is None or laser["id"] in self.soft_ids) and all(
+                m["id"] in self.soft_ids for m in shelter):
+            first = ([laser] if laser else []) + [m for m in shelter if not laser or m["id"] != laser["id"]]
+            quick = self.quick_cover(obs, first + [m for m in threats if m not in first])
+            if quick is None:
+                laser, shelter = None, []
+            else:
+                self.soft_dodge = True
         # Lightning fight: a visible hunter close enough to reach before it does much damage.
         near = threats[0] if threats else None
         near_dist = distance(me["pos"], near["pos"]) if near else math.inf
         brawl = (BRAWL and self.zap_range > 0 and near is not None and near in exposed
+                 and "lightning" not in near.get("weapons", ())
                  and near_dist <= self.zap_range + BRAWL_REACH
                  and (me["energy"] >= BRAWL_ENERGY or self.mode == "brawl"))
         grab = None if urgent or laser else self.grab_point(obs)
@@ -549,7 +1098,8 @@ class Bot:
             if threats and distance(me["pos"], self.goal) > 20 and retreat and not emergency:
                 self.goal = self.maneuver(obs, exposed or threats, True, True)
         elif laser:
-            spot = self.hide_point(obs, [laser] + [m for m in threats if m["id"] != laser["id"]])
+            spot = quick if quick is not None else self.hide_point(
+                obs, [laser] + [m for m in threats if m["id"] != laser["id"]])
             self.mode = "evade laser"
             self.goal = spot if spot is not None else self.maneuver(obs, [laser], False, retreat, laser=True)
         elif grab is not None:
@@ -578,40 +1128,47 @@ class Bot:
         elif shelter:
             # A charged laser can be held for 2 s waiting for us to step out. Stay hidden from
             # every charging mech until it fires or lets go.
-            spot = self.hide_point(obs, shelter + [m for m in threats if m not in shelter])
-            self.mode, self.goal = "cover", spot if spot is not None else tuple(me["pos"][:2])
-        elif self.repairing and not exposed and now - self.combat.combat_time > 1:
+            spot = quick if quick is not None else self.hide_point(
+                obs, shelter + [m for m in threats if m not in shelter])
+            self.mode = "cover"
+            # No hidden point in reach: keep crossing the charging mech's view instead of standing in it.
+            self.goal = spot if spot is not None else self.maneuver(obs, shelter, False, retreat, laser=True)
+        elif ((self.repairing or self.resetting) and not exposed and now - self.combat.combat_time > 1
+              and self.rest(obs, threats)):
             # The five-second tracking window can expire just as health starts regenerating.
-            self.mode, self.goal = "repair", tuple(me["pos"][:2])
+            pass  # rest() chose: our kill's loot, a hidden point farther from the hunters, or stay
         elif threats and (exposed or retreat):
             targets = exposed or threats
             if retreat:
                 self.mode = "retreat"
                 if not exposed and me["hp"] < .88 * me["max_hp"]:
-                    self.goal = tuple(me["pos"][:2])
+                    # Hidden: keep the wall between us and back away at a walk (no boost noise).
+                    away = self.fall_back(obs, self.hunters(obs, threats))
+                    self.mode = "repair" if away is not None else "retreat"
+                    self.goal = away if away is not None else tuple(me["pos"][:2])
                 else:
                     spot = self.hide_point(obs, targets)
                     self.goal = spot if spot is not None else self.maneuver(obs, targets, False, True)
             else:
                 self.mode = "duel"
-                # Peek from right beside cover while a sniper's laser is ready; while it recharges
-                # (1.65 s after a beam) a wider choice of firing positions is safe.
-                ready = any("laser" in m.get("weapons", ()) and self.laser_cool_until.get(m["id"], -1) < now + .4
-                            for m in targets)
-                held = {w["kind"] for w in me["weapons"] if w}
-                far_sniper = (held == {"gun"} and "laser" in targets[0].get("weapons", ())
-                              and distance(me["pos"], targets[0]["pos"]) > GUN_ENGAGE)
-                if far_sniper:
-                    # Gun rounds take 0.5 s+ to cross 120 m against a strafing target; wait in
-                    # cover for it to come closer instead of trading with a hitscan laser.
-                    spot, points = None, None
+                # Range is what beats the house guns and lasers, and a mech that stands still is what
+                # accurate lasers punish: fight inside the preferred band and never stop moving.
+                near, far, floor = band = self.duel_band(obs, targets[0])
+                spot = hide = None
+                if PEEK and (not GATE or floor <= distance(me["pos"], targets[0]["pos"]) <= far + 25):
+                    # Cover within a step lets us dodge its beam: fight from beside it when the range
+                    # is about right, swinging either side of the firing position.
+                    ready = any("laser" in m.get("weapons", ()) and self.laser_cool_until.get(m["id"], -1) < now + .4
+                                for m in targets)
+                    spot, points = self.peek_point(obs, targets, band, ESC_READY if ready else ESC_COOL)
+                    if spot is None and not OPEN_DUEL:
+                        hide = self.hide_point(obs, targets, points)
+                if spot is not None:
+                    self.goal = self.weave(obs, targets, threats, spot) if WEAVE else spot
+                elif hide is not None:
+                    self.goal = hide
                 else:
-                    spot, points = self.peek_point(obs, targets, self.duel_range(obs, targets[0]),
-                                                   ESC_READY if ready else ESC_COOL)
-                if spot is None:
-                    # No firing position with nearby cover: get behind something and let it come.
-                    spot = self.hide_point(obs, targets, points)
-                self.goal = spot if spot is not None else self.maneuver(obs, targets, False, False)
+                    self.goal = self.duel_point(obs, targets, threats)
         elif STALK and not urgent and any("laser" in m.get("weapons", ()) and distance(me["pos"], m["pos"]) < 280
                                           for m in threats):
             # A laser carrier we cannot currently see: close in through cover instead of
@@ -622,6 +1179,10 @@ class Bot:
             self.mode = "loot" if loot is not None else "explore"
             self.goal = loot if loot is not None else self.explore(obs)
         self.plan_at = now + (.3 if laser or threats else .7 if urgent else .9)
+        if self.mode == "duel":
+            self.plan_at = min(self.plan_at, max(now + .1, self.strafe_until))
+        else:
+            self.duel_close = False
 
     def drive(self, obs, boost):
         me = obs["self"]
@@ -640,6 +1201,7 @@ class Bot:
         now = obs["t"]
         if self.last_anchor is None or distance(pos, self.last_anchor) > 3 or dist < 5:
             self.last_anchor, self.stuck_since = tuple(pos), now
+            self.stuck_first = None
         jump = False
         if dist > 5 and self.stuck_since is not None and now - self.stuck_since > 1.6:
             if self.mode in ("loot", "grab"):
@@ -650,7 +1212,17 @@ class Bot:
             if self.mode == "explore":
                 self.last_explore = None
                 self.plan_at = now
-            if now >= self.next_jump and me["grounded"] and me["energy"] > 42:
+            if self.stuck_first is None:
+                self.stuck_first = now
+            if ((self.mode in ("retreat", "repair", "evade laser", "cover") or now - self.hurt_at < 4)
+                    and now - self.stuck_first < 4.5):
+                # Under fire or running for cover: a jet hop hangs us in the air in plain view.
+                # Give this spot up and let the planner pick another one (three tries, then hop).
+                self.dead_ends.append((tuple(self.goal[:2]), now + 6))
+                self.hide_spot = self.fall_spot = None
+                self.plan_at = now
+                self.stuck_since = now
+            elif now >= self.next_jump and me["grounded"] and me["energy"] > 42:
                 jump, self.jet_until, self.next_jump = True, now + 2.5, now + 5.0
                 self.plan_at = now
                 self.stuck_since = now
@@ -697,6 +1269,55 @@ class Bot:
                 self.dodge_until = now + min(.45, earliest + .05)
                 return side
         return move
+
+    def avoid_shell(self, obs, move, boost):
+        """Leave the blast circle of a mortar shell about to land on us: (move, boost).
+
+        Shells are lobbed over buildings (36% without line of sight) and stay visible for the
+        1.5-3 s they fly, so walking 10 m is enough."""
+        me = obs["self"]
+        rules = self.config["weapons"].get("mortar")
+        if not rules or not me["grounded"] or not obs["projectiles"]:
+            return move, boost
+        pos, vel, stats = me["pos"], me["vel"], me["stats"]
+        gravity = max(1, rules.get("gravity", 22))
+        reach = rules.get("splash_radius", 7) + stats["radius"] + 1.5
+        first = None
+        for shot in obs["projectiles"]:
+            if shot["kind"] != "mortar":
+                continue
+            p, v = shot["pos"], shot["vel"]
+            floor, t, land = pos[2], None, None
+            for _ in range(2):
+                root = v[2] * v[2] + 2 * gravity * (p[2] - floor)
+                if root < 0:
+                    t = None
+                    break
+                t = (v[2] + math.sqrt(root)) / gravity
+                land = (p[0] + v[0] * t, p[1] + v[1] * t)
+                floor = self.world.ground(*land)
+            if t is not None and 0 < t < 3.5 and distance(pos, land) < reach + 12 and (first is None or t < first[0]):
+                first = (t, land)
+        if first is None:
+            return move, boost
+        t, land = first
+        speed = stats["walk_speed"]
+        ahead = (pos[0] + (.5 * vel[0] + .5 * speed * move[0]) * t,
+                 pos[1] + (.5 * vel[1] + .5 * speed * move[1]) * t)
+        if distance(ahead, land) > reach + 2 and math.hypot(*move) > .5:
+            return move, boost  # already walking out of it, or past it
+        if distance(pos, land) > reach + 2:
+            # The way we were going leads into it: stop short of the circle, not before.
+            return (move, boost) if distance(pos, land) > reach + 8 else ([0, 0], False)
+        if distance(pos, land) > .5:
+            away = angle_to(land, pos)
+        else:
+            away = math.atan2(vel[1], vel[0]) if math.hypot(*vel[:2]) > 1 else self.heading
+        for turn in (0, .7, -.7, 1.4, -1.4):
+            yaw = away + turn * self.side
+            if self.world.walk_clear(pos, point_at(pos, yaw, 9), stats["radius"]):
+                return [math.cos(yaw), math.sin(yaw)], me["energy"] > 26
+        return move, boost
 
     GHOST_KINDS = {"laser_charge": 2.6, "gun": 2.0, "step": 2.0, "boost": 2.0, "laser": 1.0}
     GHOST_RANGE = {"near": 40, "mid": 100, "far": 190}
@@ -760,7 +1381,9 @@ class Bot:
         self.hard_deadline = self.deadline + .003
         me, now = obs["self"], obs["t"]
         self.listen(obs)
+        self.remember(obs)
         enemy, aim, fire, reload_gun = self.combat.decide(obs, self.world)
+        idle_aim = aim is None and enemy is None   # nothing to shoot or watch: free to look around
         pos = me["pos"]
         threats = sorted((m for m in obs["mechs"] if m["kind"] == "mech"),
                          key=lambda m: distance(pos, m["pos"]))[:3]
@@ -802,6 +1425,13 @@ class Bot:
         ghosts = self.ghost_threats(obs) if USE_GHOSTS else []
         shelter = [m for m in threats + ghosts if m.get("charging")
                    and .95 * self.zap_range < distance(pos, m["pos"]) <= rules["range"] + 3]
+        # Charging mechs farther than HIDE_RANGE are "distant" (see the constants): plan() dodges them
+        # only when cover is a step away, unless we are nearly dead or several charge at once.
+        charging = sum(1 for m in obs["mechs"] if m["kind"] == "mech" and m.get("charging"))
+        self.soft_ids = frozenset()
+        if me["hp"] >= HIDE_HP * me["max_hp"] and charging < HIDE_COUNT:
+            self.soft_ids = frozenset(m["id"] for m in ([laser] if laser else []) + shelter
+                                      if distance(pos, m["pos"]) > HIDE_RANGE)
         finishing = any(d.get("holder") == me["id"] and 0 < d["capture_s"] - d["progress"] <= .9
                         for d in obs.get("drops", ()))
         ready = tuple(sorted(m["id"] for m in threats if "laser" in m.get("weapons", ())
@@ -811,18 +1441,51 @@ class Bot:
         if now >= self.plan_at or key != self.plan_key or self.goal is None:
             self.plan(obs, threats, urgent, not me["in_zone"], laser, shelter)
             self.plan_key = key
+        # Loot watchdog: never keep chasing (or standing beside) an item we evidently cannot collect,
+        # for example a cube on a ledge above us. Give each target a time allowance, then skip it.
+        if self.mode in ("loot", "grab") and self.goal is not None and not any(
+                distance(self.goal, d["pos"]) < d["radius"] + 2 for d in obs.get("drops", ())):
+            chase = (round(self.goal[0]), round(self.goal[1]))
+            if chase != self.chase_key:
+                self.chase_key, self.chase_until = chase, now + 6 + distance(pos, self.goal) / 7
+            elif now > self.chase_until:
+                self.unreachable_loot[tuple(self.goal[:2])] = now + 30
+                self.chase_key, self.plan_at = None, now
+        else:
+            self.chase_key = None
         fast_escape = self.mode == "evade laser" and distance(pos, self.goal) > 4
-        boost = (fast_escape or ((urgent or self.mode == "retreat") and distance(pos, self.goal) > 8)) and me["energy"] > 26
+        boost = (fast_escape or ((urgent or self.mode in ("retreat", "cover")) and distance(pos, self.goal) > 8)) and me["energy"] > 26
+        self.dash = DASH and (me["energy"] >= 85 or (self.dash and me["energy"] > 45))
         if self.mode in ("ambush", "grab") and distance(pos, self.goal) > 8:
             # Lightning runs on the same energy as the boost: keep most of it for the fight.
             boost = me["energy"] > (70 if self.has_zap else 30)
         elif self.mode == "brawl":
             boost = bool(me["energy"] > 55 and threats and
                          distance(pos, threats[0]["pos"]) > self.zap_range + 2 and distance(pos, self.goal) > 8)
+        elif self.mode == "duel" and self.duel_close:
+            boost = me["energy"] > 35   # something got inside the minimum range: open it again quickly
+        elif self.mode == "duel" and threats and not self.has_zap:
+            # Strafe on the boost in bursts: a faster swing is harder for a straight-line lead to follow.
+            # The floor keeps enough energy for a dash to cover.
+            boost = self.dash
+        # Travelling to loot with nobody tracked: boost in bursts (walk back up to 90, spend down to 55).
+        self.cruise = me["energy"] >= 90 or (self.cruise and me["energy"] > 55)
+        if self.mode in ("loot", "explore", "grab") and not threats and not self.has_zap:
+            ring = self.our_ring(obs) if self.mode == "loot" else None
+            if ring is not None:
+                self.goal, boost = self.ring_point(pos, ring), False
+            else:
+                boost = self.cruise and distance(pos, self.goal) > 12
+        elif self.mode == "capture":
+            ring = self.our_ring(obs)
+            if ring is not None:
+                self.goal = self.ring_point(pos, ring)
         move, boost, jump = self.drive(obs, boost)
         # Sidestepping a 45-damage bullet must not carry us away from cover that stops a 315-damage beam.
         if not urgent and self.mode not in ("capture", "evade laser", "cover", "retreat", "brawl", "ambush", "grab"):
             move = self.avoid_projectile(obs, move)
+        if self.mode not in ("capture", "evade laser") and me["in_zone"]:
+            move, boost = self.avoid_shell(obs, move, boost)   # (awareness) mortar shells, in any other mode
 
         # If hidden and recovering, attacking a crate or drone would reset the repair timer.
         healing = self.mode in ("retreat", "repair", "ambush") and me["hp"] < me["max_hp"] * .88
@@ -835,31 +1498,54 @@ class Bot:
             for slot, weapon in enumerate(me["weapons"]):
                 if weapon and weapon["kind"] == "laser" and weapon["cooldown"] <= .1:
                     fire[slot] = True
-        if (self.mode == "evade laser" or (urgent and not me["in_zone"])
+        dumping = False
+        if ((self.mode == "evade laser" and not self.soft_dodge) or (urgent and not me["in_zone"])
                 or (self.mode == "ambush" and distance(pos, self.goal) > 2)):
             for slot, weapon in enumerate(me["weapons"]):
                 if weapon and weapon["kind"] == "laser":
                     # Charging cuts ground speed in half while the other weapon remains usable.
                     fire[slot] = False
+                    shot = self.combat.laser_shot
+                    if weapon.get("charge", 0) > 0 and shot is not None:
+                        # Letting go fires along the torso's actual aim: point it at the target in the
+                        # same action, and hold at most two more decisions for the torso to get there.
+                        aim, dumping = list(shot[0]), True
+                        if not shot[1] and self.release_hold < 2:
+                            fire[slot] = True
+                            self.release_hold += 1
+        elif (self.mode in ("cover", "retreat") and distance(pos, self.goal) > 2
+              and (NOCHARGE == 2 or (NOCHARGE == 1 and me["hp"] < HIDE_HP * me["max_hp"]))):
+            for slot, weapon in enumerate(me["weapons"]):
+                if weapon and weapon["kind"] == "laser" and not weapon.get("charge", 0):
+                    fire[slot] = False   # do not start a charge (half speed) on the way to cover
+        if not dumping:
+            self.release_hold = 0
+        shooting = aim is not None and bool(focus) and focus.get("kind") == "mech"
         if aim is None:
             if enemy:
                 aim = [angle_to(pos, enemy["pos"]), 0]
             elif self.listen_until > now:
                 aim = [self.last_bearing, 0]
-            elif self.seen_pos is not None and now - self.seen_at < 9 and distance(pos, self.seen_pos) > 3:
+            elif self.seen_pos is not None and now - self.seen_at < 4 and distance(pos, self.seen_pos) > 3:
                 # Face where the hunter was last seen: a hit from behind does 1.5 times the damage.
                 aim = [angle_to(pos, self.seen_pos), 0]
-            elif now % 4.5 < 1.7:
-                # House bots share vision and know where we are; spin the torso for a full look
-                # around so a sniper is spotted before its first beam, not after.
-                aim = [math.remainder(me["aim"][0] + self.side * 1.4, math.tau), -.07]
             else:
-                heading = angle_to(pos, self.goal) if distance(pos, self.goal) > 1 else self.heading
-                aim = [math.remainder(heading + .98 * math.sin(.85 * now), math.tau), -.07]
+                # Nobody known: keep the torso turning through full circles (one every 1.6 s). Everything
+                # in view within 200 m is then seen at least every 1.6 s and tracked for 5 s after, so a
+                # third party is noticed before its second shot, and loot all round is remembered.
+                aim = [math.remainder(me["aim"][0] + self.side * 1.4, math.tau), -.07]
+        # Rear armour: an attacker outside our front arc does x1.5 and is usually outside our view too.
+        face = self.guard_aim(obs, aim, shooting,
+                              shooting and self.mode not in ("retreat", "repair", "cover", "evade laser"))
+        if face is not None:
+            aim = [face, 0]
         action = dict(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload_gun)
         slot, held_value = self.weapon_slot(me)
         held = {w["kind"] for w in me["weapons"] if w}
-        near = [p for p in obs["pickups"] if WEAPON_VALUE.get(p["kind"], 0) > held_value and p["kind"] not in held
+        # Only what the server lists right now (anything within reach is inside the proximity sensors):
+        # a take of a remembered id that is gone fails, and its "drop" could still empty our slot.
+        near = [p for p in obs.get("pickups") or ()
+                if WEAPON_VALUE.get(p["kind"], 0) > held_value and p["kind"] not in held
                 and distance(p["pos"], pos) <= self.config["loot"]["pickup_radius"]
                 and abs(p["pos"][2] - pos[2]) <= 4]
         busy = slot is None or bool(me["weapons"][slot] and me["weapons"][slot].get("charge", 0) > 0)
@@ -867,6 +1553,13 @@ class Bot:
             action["take"] = max(near, key=lambda p: WEAPON_VALUE[p["kind"]])["id"]
             if me["weapons"][slot] is not None:
                 action["drop"] = slot
+        # Opening look-around: one full turn of the torso while already walking, so the weapons lying
+        # around the spawn are in memory within the first second or so.
+        if self.sweep_yaw is not None and self.sweep_left > 0:
+            self.sweep_left -= abs(math.remainder(me["aim"][0] - self.sweep_yaw, math.tau))
+        self.sweep_yaw = me["aim"][0]
+        if self.sweep_left > 0 and idle_aim and now - self.hurt_at > 2:
+            action["aim"] = [math.remainder(me["aim"][0] + self.side * 1.4, math.tau), -.07]
         if obs.get("offer"):
             priority = ("armor", "plating", "laser_damage", "laser_charge", "nanites", "gun_velocity",
                         "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range", "servos", "gun_mag",

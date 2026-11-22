@@ -102,7 +102,11 @@ class World:
                     self.tiles[ix, iy].append(prism)
         self._build_ground_grid(hello["config"]["mech"])
         self._profiles = {}
-        self._components(self._minimum_clearance(hello["config"]["mech"].get("radius", 2.5)))
+        # Every clearance class the mech can grow into (radius +5% per cube, a new class about every
+        # second cube), filled now: a flood fill inside a decision costs most of the 50 ms budget.
+        first = self._minimum_clearance(hello["config"]["mech"].get("radius", 2.5))
+        for limit in range(min(first, 14), max(first, 26) + 1):
+            self._components(limit)
         self._route = []
         self._goal = None
         self._route_radius = 0

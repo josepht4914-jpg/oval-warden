@@ -20,6 +20,7 @@ class Combat:
         self.attacker_times = {}
         self.combat_time = -100.0
         self.last_enemy_time = -100.0
+        self.laser_shot = None    # (direct laser aim at the current target, torso already on it) or None
 
     def _stats(self, weapon):
         return weapon.get("stats") or self.rules["weapons"][weapon["kind"]]
@@ -41,6 +42,9 @@ class Combat:
         candidates = []
         enemies = []
         old_id = self.focus["id"] if self.focus else None
+        # Crates and drones are shot only while no mech is reported (a mech stays reported for 5 s
+        # after it was last seen): shooting them shows our back to whoever is hunting us.
+        mech_known = any(m.get("kind") == "mech" for m in obs["mechs"])
         for obj in (*obs["mechs"], *obs.get("crates", ())):
             pos = obj["pos"]
             d = math.dist(pos, me["pos"])
@@ -62,7 +66,7 @@ class Combat:
                     threatening = recently_hit or d < 30 or closing or watching
             else:
                 # Farming only pays when the drop can reasonably be collected.
-                if d > (68 if kind == "crate" else 55):
+                if mech_known or d > (68 if kind == "crate" else 55):
                     continue
                 if me["hp"] < me["max_hp"] * 0.82 and now - self.combat_time > 2:
                     continue
@@ -72,10 +76,16 @@ class Combat:
             priority += 8 * yaw_error(me["aim"][0], math.atan2(pos[1]-muzzle[1], pos[0]-muzzle[0]))
             if obj["id"] == old_id:
                 priority -= 12
-            candidates.append((0 if threatening else 1, priority, obj))
+                if kind == "mech" and hp < 0.35 * obj.get("max_hp", 1400):
+                    # A damaged house bot never breaks off and never recovers: finish it rather
+                    # than switch to a healthier mech that happens to be nearer.
+                    priority -= 90
+                    threatening = True
+            candidates.append((0 if threatening else 1 if kind == "mech" else 2, priority, obj))
         closest = min(enemies, key=lambda e: e[0])[1] if enemies else None
+        # Every mech is tried for a line of fire before any object.
         candidates.sort(key=lambda e: (e[0], e[1]))
-        for _, _, obj in candidates[:5]:
+        for _, _, obj in candidates[:6]:
             radius, height = self._body(obj)
             x, y, z = obj["pos"]
             point = (x, y, z + 0.5 * height)
@@ -133,6 +143,7 @@ class Combat:
         reach = max((self._stats(w).get("range", 125) for _, w in weapons.values()), default=0)
         target, point, radius, height, enemy = self._select(obs, world, muzzle, reach)
         self.focus = target
+        self.laser_shot = None
         if target and target.get("kind") == "mech":
             self.last_enemy_time = now
         triggers = [False, False]
@@ -212,6 +223,11 @@ class Combat:
         # that allowance to half a body width so a large retarget cannot waste a round.
         yaw_tolerance = math.atan2(radius * 0.95, max(1, math.dist(shooter[:2], point[:2])))
         pitch_tolerance = math.atan2(height * 0.37, dist)
+        if "laser" in solutions:
+            # For a release forced from outside (the bot breaking off to dodge): where the beam has
+            # to point, and whether the torso is already there.
+            self.laser_shot = (direct, yaw_error(current_yaw, direct[0]) <= yaw_tolerance
+                               and abs(current_pitch - direct[1]) <= pitch_tolerance)
         for kind, (slot, w) in weapons.items():
             if kind == "lightning":
                 stats = self._stats(w)
