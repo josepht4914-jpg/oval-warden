@@ -25,10 +25,21 @@ def with_height(pos, height):
 
 import os  # noqa: E402  (experiment knob for the duel simulator; unset in matches)
 GUN_ENGAGE = float(os.environ.get("OW_GUN_ENGAGE", "120"))
-# Second-slot preference. Mortar 0: never picked up (lasers do +60% to its carrier).
-WEAPON_VALUE = {"laser": 3, "lightning": 2, "mortar": 0}
+# Weapon preference. Mortar 0: never picked up (lasers do +60% to its carrier). A held weapon is
+# replaced by a pickup worth more; the gun's value decides whether it is ever given up.
+WEAPON_VALUE = {k: float(v) for k, v in (item.split(":") for item in os.environ.get(
+    "OW_WEAPONS", "laser:3,lightning:2,mortar:0,gun:1").split(","))}
 # Wall-clock time the cover search may use per decision (the server allows 50 ms in total).
 PLAN_BUDGET_S = 0.012
+# Tactical constants (environment overrides exist only for simulator experiments).
+REPAIR_LOW = float(os.environ.get("OW_REPAIR_LOW", ".46"))     # start hiding to repair below this HP share
+REPAIR_HIGH = float(os.environ.get("OW_REPAIR_HIGH", ".85"))   # resume fighting above this HP share
+ESC_READY = float(os.environ.get("OW_ESC_READY", "5"))          # max dash to cover while an enemy laser is ready
+ESC_COOL = float(os.environ.get("OW_ESC_COOL", "8.5"))          # ... while every enemy laser is recharging
+EXTRA_EXPOSE = float(os.environ.get("OW_EXTRA_EXPOSE", "10"))   # peek penalty per extra enemy with a shot
+LOS_THREATS = int(os.environ.get("OW_LOS_THREATS", "2"))        # enemies checked in the cover search
+USE_GHOSTS = os.environ.get("OW_GHOSTS", "1") == "1"            # treat unexplained sounds as unseen threats
+PRECHARGE = os.environ.get("OW_PRECHARGE", "0") == "1"          # charge our laser while hiding from a held charge
 
 
 class Bot:
@@ -61,6 +72,7 @@ class Bot:
         self.was_charging = {}
         self.deadline = math.inf
         self.hide_spot, self.hide_at = None, -99.0
+        self.ghosts = []
 
     def listen(self, obs):
         now = obs["t"]
@@ -144,7 +156,7 @@ class Bot:
         held = {w["kind"] for w in me["weapons"] if w}
         for weapon in obs["pickups"]:
             if WEAPON_VALUE.get(weapon["kind"], 0) > held_value and weapon["kind"] not in held:
-                consider(weapon, {"laser": 53, "lightning": 50}[weapon["kind"]], 105)
+                consider(weapon, 50 + WEAPON_VALUE[weapon["kind"]], 105)
         for crate in obs["crates"]:
             consider(crate, 24, 54)
         for drop in obs.get("drops", []):
@@ -157,13 +169,14 @@ class Bot:
     def weapon_slot(me):
         """(slot a better pickup would go into, value of what is there now).
 
-        The gun stays. The other slot prefers a laser, then lightning. A mortar is never worth
-        holding against house bots: lasers do +60% (cook-off) to a mech carrying one."""
+        The target loadout is laser + lightning: the laser outranges the house snipers and lightning
+        shorts their lasers up close, so the arm gun is given up for whichever comes second. A mortar
+        is never worth holding against house bots: lasers do +60% (cook-off) to a mech carrying one."""
         weapons = me["weapons"]
         for slot, weapon in enumerate(weapons):
             if weapon is None:
                 return slot, 0
-        others = [(WEAPON_VALUE.get(w["kind"], 0), slot) for slot, w in enumerate(weapons) if w["kind"] != "gun"]
+        others = [(WEAPON_VALUE.get(w["kind"], 0), slot) for slot, w in enumerate(weapons)]
         if not others:
             return None, math.inf
         value, slot = min(others)
@@ -313,7 +326,7 @@ class Bot:
         pos, stats = me["pos"], me["stats"]
         radius = stats["radius"]
         guns = [(m["id"], with_height(m["pos"], self.config["mech"]["muzzle_height"] * self.body_scale(m)))
-                for m in threats[:2]]
+                for m in threats[:LOS_THREATS]]
         points = []
         for ring, count, offset in rings:
             # Wall-clock guard: near rings come first, and a late answer costs a second of coasting.
@@ -351,7 +364,7 @@ class Bot:
         stats = obs["self"]["stats"]
         z = self.world.ground(spot[0], spot[1])
         body = (spot[0], spot[1], z + 0.5 * stats["height"])
-        for m in threats[:2]:
+        for m in threats[:LOS_THREATS]:
             gun = with_height(m["pos"], self.config["mech"]["muzzle_height"] * self.body_scale(m))
             a = angle_to(gun, body) + math.pi / 2
             for side in (0, -stats["radius"], stats["radius"]):
@@ -403,7 +416,7 @@ class Bot:
             if escape > escape_limit:
                 continue
             score = (-0.5 * ring - 3.0 * escape - 0.06 * abs(distance(p, primary["pos"]) - ideal)
-                     - 10 * (len(seen) - 1))
+                     - EXTRA_EXPOSE * (len(seen) - 1))
             if score > best_score:
                 best, best_score = p, score
         return best, points
@@ -433,11 +446,11 @@ class Bot:
         eyes = with_height(me["pos"], me["stats"]["eye_height"])
         exposed = [m for m in threats if self.world.clear(eyes, with_height(m["pos"], 4.5 * (
             1 + self.config["cubes"]["size_per_cube"] * m.get("cubes", 0))))]
-        if len(exposed) >= 2 or (exposed and me["hp"] < .46 * me["max_hp"]):
+        if len(exposed) >= 2 or (exposed and me["hp"] < REPAIR_LOW * me["max_hp"]):
             self.hide_until = now + me["stats"]["regen_delay"] + 2
-        if exposed and me["hp"] < .46 * me["max_hp"]:
+        if exposed and me["hp"] < REPAIR_LOW * me["max_hp"]:
             self.repairing = True
-        if me["hp"] >= .85 * me["max_hp"]:
+        if me["hp"] >= REPAIR_HIGH * me["max_hp"]:
             self.repairing = False
         retreat = self.repairing or now < self.hide_until
         capture = self.finishing_drop(obs, threats)
@@ -484,7 +497,7 @@ class Bot:
                     spot, points = None, None
                 else:
                     spot, points = self.peek_point(obs, targets, self.duel_range(obs, targets[0]),
-                                                   5 if ready else 8.5)
+                                                   ESC_READY if ready else ESC_COOL)
                 if spot is None:
                     # No firing position with nearby cover: get behind something and let it come.
                     spot = self.hide_point(obs, targets, points)
@@ -575,6 +588,46 @@ class Bot:
                 return side
         return move
 
+    GHOST_KINDS = {"laser_charge": 2.6, "gun": 2.0, "step": 2.0, "boost": 2.0, "laser": 1.0}
+    GHOST_RANGE = {"near": 40, "mid": 100, "far": 190}
+
+    def ghost_threats(self, obs):
+        """Mechs we hear but cannot see, placed along the heard bearing.
+
+        House bots share vision, so an unseen one charging a laser is charging it at us. A sound
+        whose bearing matches no visible mech starts a short-lived estimate of its position."""
+        now, pos = obs["t"], obs["self"]["pos"]
+        visible = [angle_to(pos, m["pos"]) for m in obs["mechs"] if m.get("kind") == "mech"]
+        for sound in obs.get("sounds", ()):
+            kind = sound.get("kind")
+            if kind not in self.GHOST_KINDS or (kind != "laser_charge" and sound.get("dist") == "far"):
+                continue
+            if any(abs(math.remainder(sound["bearing"] - b, math.tau)) < math.radians(16) for b in visible):
+                continue
+            heard = now - sound.get("age", 0)
+            spot = point_at(pos, sound["bearing"], self.GHOST_RANGE.get(sound.get("dist"), 100))
+            ghost = dict(kind=kind, spot=spot, heard=heard, until=heard + self.GHOST_KINDS[kind])
+            # One estimate per direction: a newer sound from the same sector replaces the older one,
+            # except that a beam (laser) ends the charge it came from.
+            keep = []
+            for old in self.ghosts:
+                same = abs(math.remainder(angle_to(pos, old["spot"]) - sound["bearing"], math.tau)) < math.radians(20)
+                if same and (kind != "laser_charge" or old["kind"] != "laser_charge"):
+                    if kind in ("gun", "step", "boost") and old["kind"] == "laser_charge" and old["until"] > now:
+                        ghost = None  # do not let footsteps erase a charge still in progress
+                        keep.append(old)
+                    continue
+                keep.append(old)
+            self.ghosts = keep + ([ghost] if ghost else [])
+        self.ghosts = [g for g in self.ghosts if g["until"] > now]
+        out = []
+        for i, g in enumerate(self.ghosts):
+            x, y = g["spot"]
+            out.append(dict(id=-1 - i, kind="mech", ghost=True, pos=[x, y, self.world.ground(x, y)], vel=[0, 0, 0],
+                            aim=[angle_to(g["spot"], pos), 0], cubes=0, weapons=["gun", "laser"],
+                            charging=g["kind"] == "laser_charge"))
+        return out
+
     def track_lasers(self, obs):
         """Estimate when each enemy laser can fire again from beams, hits and charge changes."""
         now = obs["t"]
@@ -604,14 +657,15 @@ class Bot:
         self.track_lasers(obs)
         laser = self.charged_laser(obs)
         rules = self.config["weapons"]["laser"]
-        # Every visible mech charging a laser in range, aimed at us or not yet.
-        shelter = [m for m in threats if m.get("charging")
+        # Every mech charging a laser in range, aimed at us or not yet, including ones only heard.
+        ghosts = self.ghost_threats(obs) if USE_GHOSTS else []
+        shelter = [m for m in threats + ghosts if m.get("charging")
                    and distance(pos, m["pos"]) <= rules["range"] + 3]
         finishing = any(d.get("holder") == me["id"] and 0 < d["capture_s"] - d["progress"] <= .9
                         for d in obs.get("drops", ()))
         ready = tuple(sorted(m["id"] for m in threats if "laser" in m.get("weapons", ())
                              and self.laser_cool_until.get(m["id"], -1) < now + .4))
-        key = (urgent, tuple(m["id"] for m in threats), me["hp"] < me["max_hp"] * .46,
+        key = (urgent, tuple(m["id"] for m in threats), me["hp"] < me["max_hp"] * REPAIR_LOW,
                finishing, laser and laser["id"], tuple(m["id"] for m in shelter), ready)
         if now >= self.plan_at or key != self.plan_key or self.goal is None:
             self.plan(obs, threats, urgent, not me["in_zone"], laser, shelter)
@@ -628,6 +682,12 @@ class Bot:
         focus = self.combat.focus
         if healing and (not focus or focus.get("kind") != "mech"):
             fire, aim = [False, False], None
+        if self.mode == "cover" and PRECHARGE:
+            # Waiting behind a wall for a held enemy charge: charge ours (speed does not matter while
+            # standing still) so the return shot fires the moment we step out into its cooldown.
+            for slot, weapon in enumerate(me["weapons"]):
+                if weapon and weapon["kind"] == "laser" and weapon["cooldown"] <= .1:
+                    fire[slot] = True
         if self.mode == "evade laser" or (urgent and not me["in_zone"]):
             for slot, weapon in enumerate(me["weapons"]):
                 if weapon and weapon["kind"] == "laser":

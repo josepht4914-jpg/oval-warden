@@ -56,7 +56,7 @@ class Decisions(unittest.TestCase):
         self.rival = dict(id=1, kind="mech", pos=[60, 0, 0], vel=[0, 11.7, 0], aim=[0, 0],
                           hp=1400, cubes=0, weapons=["gun"], charging=False)
 
-    def test_weapon_choices_skip_mortar_and_upgrade_to_laser(self):
+    def test_weapon_choices_build_laser_and_lightning(self):
         # House lasers do +60% to a mech carrying a mortar, so a mortar is never taken.
         rules = self.hello["config"]["weapons"]
         gun = dict(kind="gun", cooldown=0, ammo=12, reload=0, stats=rules["gun"])
@@ -65,9 +65,10 @@ class Decisions(unittest.TestCase):
             return dict(kind=kind, cooldown=0, charge=charge, stats=rules[kind])
 
         self.obs.update(mechs=[], crates=[], cubes=[])
+        # Target loadout is laser + lightning: the gun (slot 0) is given up for the second of them.
         cases = ((None, "mortar", None), (None, "laser", (8001, None)), (held("mortar"), "lightning", (8001, 1)),
-                 (held("lightning"), "laser", (8001, 1)), (held("laser"), "lightning", None),
-                 (held("laser", charge=.3), "laser", None))
+                 (held("lightning"), "laser", (8001, 0)), (held("laser"), "lightning", (8001, 0)),
+                 (held("laser", charge=.3), "laser", None), (held("laser"), "mortar", None))
         for second, pickup, expected in cases:
             self.me["weapons"] = [gun, second]
             self.obs["pickups"] = [dict(id=8001, kind=pickup, pos=[1, 0, 0])]
