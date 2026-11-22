@@ -60,6 +60,7 @@ class Bot:
         self.laser_cool_until = {}
         self.was_charging = {}
         self.deadline = math.inf
+        self.hide_spot, self.hide_at = None, -99.0
 
     def listen(self, obs):
         now = obs["t"]
@@ -348,7 +349,7 @@ class Bot:
     def still_hidden(self, obs, threats, spot):
         """True if every part of a mech standing at spot is out of the listed threats' line of fire."""
         stats = obs["self"]["stats"]
-        z = self.world.ground(*spot)
+        z = self.world.ground(spot[0], spot[1])
         body = (spot[0], spot[1], z + 0.5 * stats["height"])
         for m in threats[:2]:
             gun = with_height(m["pos"], self.config["mech"]["muzzle_height"] * self.body_scale(m))
@@ -363,10 +364,11 @@ class Bot:
 
         Keeps the spot already being run to while it still hides us: switching targets mid-dash
         throws away the momentum the 0.75 s laser warning depends on."""
-        pos = obs["self"]["pos"]
-        if (self.goal is not None and self.mode in ("evade laser", "cover", "retreat")
-                and distance(pos, self.goal) < 40 and self.still_hidden(obs, threats, self.goal)):
-            return tuple(self.goal[:2])
+        pos, now = obs["self"]["pos"], obs["t"]
+        if (self.hide_spot is not None and now - self.hide_at < 1.5 and distance(pos, self.hide_spot) < 40
+                and self.still_hidden(obs, threats, self.hide_spot)):
+            self.hide_at = now
+            return self.hide_spot
         if points is None:
             points = self.cover_points(obs, threats)
         foe = threats[0]["pos"]
@@ -377,7 +379,9 @@ class Bot:
                 group = self.cover_points(obs, threats, self.FAR_RINGS)
             hidden = [c for c in group if not c[2]]
             if hidden:
-                return min(hidden, key=lambda c: c[3] - 0.08 * distance(c[0], foe))[0]
+                self.hide_spot = tuple(min(hidden, key=lambda c: c[3] - 0.08 * distance(c[0], foe))[0][:2])
+                self.hide_at = now
+                return self.hide_spot
         return None
 
     def peek_point(self, obs, threats, ideal, escape_limit=7):
